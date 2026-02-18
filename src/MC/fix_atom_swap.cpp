@@ -720,62 +720,69 @@ int FixAtomSwap::attempt_swap()
   // --- LOCAL ENERGY FAST PATH ---
 
   if (use_local_energy) {
-    double delta = energy_local_delta();
-
+    double delta_local = energy_local_delta();
+    double delta;
+    MPI_Allreduce(&delta_local, &delta, 1, MPI_DOUBLE, MPI_SUM, world);
 
     if (random_equal->uniform() < exp(-beta * delta)) {
-      // accepted: apply swap permanently on all procs (local + ghosts)
-      // we reuse the same logic as energy_local_delta but make it stick
-      
-      // Update local energy cache with new values since swap is accepted
+      // accepted: apply swap permanently on all procs
+      // Update local energy cache
       for (int i = 0; i < n_affected_count; i++) {
         int idx = affected_list[i];
         local_energy_cache[idx] = local_energy_new[idx];
       }
 
-      int total_to_sync = 2 * group_size;
-      std::vector<tagint> swapped_tags(total_to_sync, 0);
-      std::vector<tagint> local_tags(total_to_sync, 0);
-      for (int n = 0; n < group_size; n++) {
-        if (local_swap_igroup[n] >= 0) local_tags[n] = atom->tag[local_swap_igroup[n]];
-        if (local_swap_jgroup[n] >= 0) local_tags[group_size + n] = atom->tag[local_swap_jgroup[n]];
+      // Sync and pick global indices (already in pick_iswap_group, but need them here too)
+      // Actually, we can just regenerate them since random_equal is synced
+      std::vector<int> gi, gj;
+      if (niswap > 0) {
+        while ((int)gi.size() < group_size) {
+          int candidate = static_cast<int>(niswap * random_equal->uniform());
+          bool duplicate = false;
+          for (int idx : gi) if (idx == candidate) { duplicate = true; break; }
+          if (!duplicate) gi.push_back(candidate);
+        }
       }
-      MPI_Allreduce(local_tags.data(), swapped_tags.data(), total_to_sync, MPI_LMP_TAGINT, MPI_MAX, world);
+      if (njswap > 0) {
+        while ((int)gj.size() < group_size) {
+          int candidate = static_cast<int>(njswap * random_equal->uniform());
+          bool duplicate = false;
+          for (int idx : gj) if (idx == candidate) { duplicate = true; break; }
+          if (!duplicate) gj.push_back(candidate);
+        }
+      }
 
-      for (int n = 0; n < total_to_sync; n++) {
-        int idx = atom->map(swapped_tags[n]);
-        if (idx >= 0) {
-          atom->type[idx] = (n < group_size) ? jtype : itype;
-          if (atom->q_flag) atom->q[idx] = (n < group_size) ? qtype[1] : qtype[0];
-          if (atom->rmass != nullptr) atom->rmass[idx] = (n < group_size) ? mtype[1] : mtype[0];
+      // Apply locally
+      for (int n = 0; n < group_size; n++) {
+        int idx_i = atom->map(all_iswap_tags[gi[n]]);
+        int idx_j = atom->map(all_jswap_tags[gj[n]]);
+        
+        if (idx_i >= 0 && idx_i < atom->nlocal) {
+          atom->type[idx_i] = jtype;
+          if (atom->q_flag) atom->q[idx_i] = qtype[1];
+          if (atom->rmass != nullptr) atom->rmass[idx_i] = mtype[1];
+          if (ke_flag) {
+            atom->v[idx_i][0] *= sqrt_mass_ratio[itype][jtype];
+            atom->v[idx_i][1] *= sqrt_mass_ratio[itype][jtype];
+            atom->v[idx_i][2] *= sqrt_mass_ratio[itype][jtype];
+          }
+        }
+        if (idx_j >= 0 && idx_j < atom->nlocal) {
+          atom->type[idx_j] = itype;
+          if (atom->q_flag) atom->q[idx_j] = qtype[0];
+          if (atom->rmass != nullptr) atom->rmass[idx_j] = mtype[0];
+          if (ke_flag) {
+            atom->v[idx_j][0] *= sqrt_mass_ratio[jtype][itype];
+            atom->v[idx_j][1] *= sqrt_mass_ratio[jtype][itype];
+            atom->v[idx_j][2] *= sqrt_mass_ratio[jtype][itype];
+          }
         }
       }
 
       update_swap_atoms_list();
-      if (ke_flag) {
-        for (int n = 0; n < group_size; n++) {
-          int i = local_swap_igroup[n];
-          int j = local_swap_jgroup[n];
-          if (i >= 0) {
-            atom->v[i][0] *= sqrt_mass_ratio[itype][jtype];
-            atom->v[i][1] *= sqrt_mass_ratio[itype][jtype];
-            atom->v[i][2] *= sqrt_mass_ratio[itype][jtype];
-          }
-          if (j >= 0) {
-            atom->v[j][0] *= sqrt_mass_ratio[jtype][itype];
-            atom->v[j][1] *= sqrt_mass_ratio[jtype][itype];
-            atom->v[j][2] *= sqrt_mass_ratio[jtype][itype];
-          }
-          if (vizsteps > 0) {
-            if (i >= 0) vizatoms[atom->tag[i]] = std::make_pair(vizsteps, jtype);
-            if (j >= 0) vizatoms[atom->tag[j]] = std::make_pair(vizsteps, itype);
-          }
-        }
-      }
       energy_stored += delta;
       return 1;
     }
-    // rejected: nothing to revert since energy_local_delta() already reverted
     return 0;
   }
 
@@ -1049,13 +1056,13 @@ int FixAtomSwap::pick_j_swap_atom()
 void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
 {
   for (int n = 0; n < nselect; n++) selected[n] = -1;
+  if (niswap == 0) return;
 
   std::vector<int> global_indices;
   global_indices.reserve(nselect);
   
   while ((int)global_indices.size() < nselect) {
     int candidate = static_cast<int>(niswap * random_equal->uniform());
-    // check if already selected
     bool duplicate = false;
     for (int idx : global_indices) {
       if (idx == candidate) {
@@ -1066,13 +1073,11 @@ void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
     if (!duplicate) global_indices.push_back(candidate);
   }
 
-  // determine which of the N selected atoms are on this proc
   for (int n = 0; n < nselect; n++) {
-    int iwhichglobal = global_indices[n];
-    if ((iwhichglobal >= niswap_before) && (iwhichglobal < niswap_before + niswap_local)) {
-      int iwhichlocal = iwhichglobal - niswap_before;
-      selected[n] = local_swap_iatom_list[iwhichlocal];
-    }
+    tagint target_tag = all_iswap_tags[global_indices[n]];
+    selected[n] = atom->map(target_tag);
+    // only keep if local (atom->map returns local index or -1)
+    if (selected[n] >= atom->nlocal) selected[n] = -1;
   }
 }
 
@@ -1085,15 +1090,13 @@ void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
 void FixAtomSwap::pick_jswap_group(int *selected, int nselect)
 {
   for (int n = 0; n < nselect; n++) selected[n] = -1;
+  if (njswap == 0) return;
 
-  // generate N unique random global indices using rejection sampling
-  // use random_equal so all procs generate same sequence
   std::vector<int> global_indices;
   global_indices.reserve(nselect);
   
   while ((int)global_indices.size() < nselect) {
     int candidate = static_cast<int>(njswap * random_equal->uniform());
-    // check if already selected
     bool duplicate = false;
     for (int idx : global_indices) {
       if (idx == candidate) {
@@ -1104,13 +1107,10 @@ void FixAtomSwap::pick_jswap_group(int *selected, int nselect)
     if (!duplicate) global_indices.push_back(candidate);
   }
 
-  // determine which of the N selected atoms are on this proc
   for (int n = 0; n < nselect; n++) {
-    int jwhichglobal = global_indices[n];
-    if ((jwhichglobal >= njswap_before) && (jwhichglobal < njswap_before + njswap_local)) {
-      int jwhichlocal = jwhichglobal - njswap_before;
-      selected[n] = local_swap_jatom_list[jwhichlocal];
-    }
+    tagint target_tag = all_jswap_tags[global_indices[n]];
+    selected[n] = atom->map(target_tag);
+    if (selected[n] >= atom->nlocal) selected[n] = -1;
   }
 }
 
@@ -1223,6 +1223,32 @@ void FixAtomSwap::update_swap_atoms_list()
   MPI_Allreduce(&njswap_local, &njswap, 1, MPI_INT, MPI_SUM, world);
   MPI_Scan(&njswap_local, &njswap_before, 1, MPI_INT, MPI_SUM, world);
   njswap_before -= njswap_local;
+
+  if (use_local_energy) {
+    int nprocs = comm->nprocs;
+    std::vector<int> recvcounts(nprocs);
+    std::vector<int> displs(nprocs);
+
+    // Sync type-1 tags
+    MPI_Allgather(&niswap_local, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
+    displs[0] = 0;
+    for (int i = 1; i < nprocs; i++) displs[i] = displs[i-1] + recvcounts[i-1];
+    all_iswap_tags.assign(niswap, 0);
+    std::vector<tagint> local_itags(niswap_local);
+    for (int i = 0; i < niswap_local; i++) local_itags[i] = atom->tag[local_swap_iatom_list[i]];
+    MPI_Allgatherv(local_itags.data(), niswap_local, MPI_LMP_TAGINT,
+                   all_iswap_tags.data(), recvcounts.data(), displs.data(), MPI_LMP_TAGINT, world);
+
+    // Sync type-2 tags
+    MPI_Allgather(&njswap_local, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
+    displs[0] = 0;
+    for (int i = 1; i < nprocs; i++) displs[i] = displs[i-1] + recvcounts[i-1];
+    all_jswap_tags.assign(njswap, 0);
+    std::vector<tagint> local_jtags(njswap_local);
+    for (int i = 0; i < njswap_local; i++) local_jtags[i] = atom->tag[local_swap_jatom_list[i]];
+    MPI_Allgatherv(local_jtags.data(), njswap_local, MPI_LMP_TAGINT,
+                   all_jswap_tags.data(), recvcounts.data(), displs.data(), MPI_LMP_TAGINT, world);
+  }
 }
 
 /* ---------------------------------------------------------------------- */
