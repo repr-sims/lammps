@@ -24,6 +24,7 @@ FixStyle(atom/swap,FixAtomSwap);
 
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace LAMMPS_NS {
 
@@ -88,6 +89,8 @@ class FixAtomSwap : public Fix {
   int group_size;              // number of atoms to swap simultaneously (N)
   int *local_swap_igroup;      // indices of N type-1 atoms selected for swap
   int *local_swap_jgroup;      // indices of N type-2 atoms selected for swap
+  std::vector<tagint> all_iswap_tags; // global list of type-1 candidate tags
+  std::vector<tagint> all_jswap_tags; // global list of type-2 candidate tags
 
   enum { LOCAL_AUTO, LOCAL_YES, LOCAL_NO } local_energy_mode;  // user preference
   bool use_local_energy;       // true = use local energy optimization
