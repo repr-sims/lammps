@@ -78,6 +78,9 @@ class FixAtomSwap : public Fix {
   int *local_swap_iatom_list;
   int *local_swap_jatom_list;
   int *local_swap_atom_list;
+  int *is_affected;            // mark array for CollectAffectedAtoms
+  int *affected_list;          // list of local atoms to sum energy over
+  int max_affected;
 
   int group_size;              // number of atoms to swap simultaneously (N)
   int *local_swap_igroup;      // indices of N type-1 atoms selected for swap
@@ -85,7 +88,6 @@ class FixAtomSwap : public Fix {
 
   enum { LOCAL_AUTO, LOCAL_YES, LOCAL_NO } local_energy_mode;  // user preference
   bool use_local_energy;       // true = use local energy optimization
-  bool needs_second_shell;     // true = EAM-style (0.5 pair factor), false = PACE-style (exact site energy)
 
   class RanPark *random_equal;
   class RanPark *random_unequal;

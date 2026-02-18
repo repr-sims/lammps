@@ -56,6 +56,7 @@ class Pair : protected Pointers {
   int single_hessian_enable;    // 1 if single_hessian() routine exists
   int atomic_energy_enable;     // 1 if compute_atomic_energy() routine exists
 
+
   int restartinfo;                // 1 if pair style writes restart info
   int respa_enable;               // 1 if inner/middle/outer rRESPA routines
   int one_coeff;                  // 1 if allows only one coeff * * call
