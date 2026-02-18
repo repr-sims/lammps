@@ -79,6 +79,14 @@ class FixAtomSwap : public Fix {
   int *local_swap_jatom_list;
   int *local_swap_atom_list;
 
+  int group_size;              // number of atoms to swap simultaneously (N)
+  int *local_swap_igroup;      // indices of N type-1 atoms selected for swap
+  int *local_swap_jgroup;      // indices of N type-2 atoms selected for swap
+
+  enum { LOCAL_AUTO, LOCAL_YES, LOCAL_NO } local_energy_mode;  // user preference
+  bool use_local_energy;       // true = use local energy optimization
+  bool needs_second_shell;     // true = EAM-style (0.5 pair factor), false = PACE-style (exact site energy)
+
   class RanPark *random_equal;
   class RanPark *random_unequal;
 
@@ -96,11 +104,20 @@ class FixAtomSwap : public Fix {
   int attempt_semi_grand();
   int attempt_swap();
   double energy_full();
+  double energy_local_delta();
   int pick_semi_grand_atom();
   int pick_i_swap_atom();
   int pick_j_swap_atom();
+  void pick_iswap_group(int *, int);
+  void pick_jswap_group(int *, int);
   void update_semi_grand_atoms_list();
   void update_swap_atoms_list();
+
+  // New method to capture neighbor list
+  void init_list(int, class NeighList *) override;
+
+  // Neighbor list pointer
+  class NeighList *list;
 };
 
 }    // namespace LAMMPS_NS

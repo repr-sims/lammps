@@ -39,6 +39,7 @@ class PairHybridScaled : public PairHybrid {
   void write_restart(FILE *) override;
   void read_restart(FILE *) override;
   double single(int, int, int, int, double, double, double, double &) override;
+  double compute_atomic_energy(int, class NeighList *) override;
   void born_matrix(int, int, int, int, double, double, double, double &, double &) override;
 
   void init_svector() override;
