@@ -243,6 +243,20 @@ void PairHybrid::compute_outer(int eflag, int vflag)
 }
 
 /* ----------------------------------------------------------------------
+   compute site energy of atom i by summing over all sub-styles
+------------------------------------------------------------------------- */
+
+double PairHybrid::compute_atomic_energy(int i, NeighList */*list*/)
+{
+  double e_total = 0.0;
+  for (int m = 0; m < nstyles; m++) {
+    if (styles[m]->atomic_energy_enable)
+      e_total += styles[m]->compute_atomic_energy(i, styles[m]->list);
+  }
+  return e_total;
+}
+
+/* ----------------------------------------------------------------------
    allocate all arrays
 ------------------------------------------------------------------------- */
 
@@ -440,6 +454,14 @@ void PairHybrid::flags()
   respa_enable = (respa_enable == nstyles) ? 1 : 0;
   restartinfo = (restartinfo == nstyles) ? 1 : 0;
   born_matrix_enable = (born_matrix_enable == nstyles) ? 1 : 0;
+
+  // atomic_energy_enable = 1 only if all sub-styles support it
+  {
+    int ae_count = 0;
+    for (int mm = 0; mm < nstyles; mm++)
+      if (styles[mm]->atomic_energy_enable) ++ae_count;
+    atomic_energy_enable = (ae_count == nstyles) ? 1 : 0;
+  }
   init_svector();
 
   // set centroidstressflag for pair hybrid

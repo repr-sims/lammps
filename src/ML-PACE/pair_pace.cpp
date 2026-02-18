@@ -95,6 +95,7 @@ PairPACE::PairPACE(LAMMPS *lmp) : Pair(lmp)
 
   aceimpl = new ACEImpl;
   recursive = false;
+  atomic_energy_enable = 1;
 
   scale = nullptr;
 
@@ -237,6 +238,31 @@ void PairPACE::compute(int eflag, int vflag)
   if (vflag_fdotr) virial_fdotr_compute();
 
   // end modifications YL
+}
+
+/* ----------------------------------------------------------------------
+   compute site energy of atom i
+------------------------------------------------------------------------- */
+
+double PairPACE::compute_atomic_energy(int i, NeighList *neighborList)
+{
+  double **x = atom->x;
+  int *type = atom->type;
+
+  int *jlist = neighborList->firstneigh[i];
+  int jnum = neighborList->numneigh[i];
+
+  // resize if needed
+  aceimpl->ace->resize_neighbours_cache(jnum);
+
+  try {
+    aceimpl->ace->compute_atom(i, x, type, jnum, jlist);
+  } catch (std::exception &e) {
+    error->one(FLERR, e.what());
+  }
+
+  int itype = type[i];
+  return scale[itype][itype] * aceimpl->ace->e_atom;
 }
 
 /* ---------------------------------------------------------------------- */

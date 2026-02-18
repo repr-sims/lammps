@@ -278,6 +278,20 @@ void PairHybridScaled::compute(int eflag, int vflag)
 }
 
 /* ----------------------------------------------------------------------
+   compute site energy of atom i, scaled by substyle scale factors
+------------------------------------------------------------------------- */
+
+double PairHybridScaled::compute_atomic_energy(int i, NeighList */*list*/)
+{
+  double e_total = 0.0;
+  for (int m = 0; m < nstyles; m++) {
+    if (styles[m]->atomic_energy_enable)
+      e_total += scaleval[m] * styles[m]->compute_atomic_energy(i, styles[m]->list);
+  }
+  return e_total;
+}
+
+/* ----------------------------------------------------------------------
    create one pair style for each arg in list
 ------------------------------------------------------------------------- */
 

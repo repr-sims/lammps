@@ -46,6 +46,7 @@ class PairPACE : public Pair {
   void coeff(int, char **) override;
   void init_style() override;
   double init_one(int, int) override;
+  double compute_atomic_energy(int, class NeighList *) override;
 
   void *extract(const char *, int &) override;
   void *extract_peratom(const char *, int &) override;

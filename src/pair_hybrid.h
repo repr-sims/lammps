@@ -62,6 +62,7 @@ class PairHybrid : public Pair {
   void compute_middle() override;
   void compute_outer(int, int) override;
   void *extract(const char *, int &) override;
+  double compute_atomic_energy(int, class NeighList *) override;
   void reset_dt() override;
 
   int check_ijtype(int, int, char *);
