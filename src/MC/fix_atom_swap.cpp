@@ -61,9 +61,11 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
     qtype(nullptr), mtype(nullptr), sqrt_mass_ratio(nullptr), local_swap_iatom_list(nullptr),
     local_swap_jatom_list(nullptr), local_swap_atom_list(nullptr), local_swap_igroup(nullptr),
     local_swap_jgroup(nullptr), is_affected(nullptr), affected_list(nullptr),
+    local_energy_cache(nullptr), local_energy_new(nullptr),
     random_equal(nullptr), random_unequal(nullptr), c_pe(nullptr),
-    imgobjs(nullptr), imgparms(nullptr)
+    imgobjs(nullptr), imgparms(nullptr), list(nullptr), max_affected(0)
 {
+
   if (narg < 10) utils::missing_cmd_args(FLERR, "fix atom/swap", error);
 
   dynamic_group_allow = 1;
@@ -163,6 +165,8 @@ FixAtomSwap::~FixAtomSwap()
   memory->destroy(local_swap_jgroup);
   memory->destroy(is_affected);
   memory->destroy(affected_list);
+  memory->destroy(local_energy_cache);
+  memory->destroy(local_energy_new);
   delete[] idregion;
   delete random_equal;
   delete random_unequal;
@@ -536,22 +540,38 @@ void FixAtomSwap::pre_exchange()
 
   if (next_reneighbor != update->ntimestep) return;
 
-  mc_active = 1;
-
-  // ensure current system is ready to compute energy
-
   if (domain->triclinic) domain->x2lamda(atom->nlocal);
   domain->pbc();
   comm->exchange();
   comm->borders();
   if (domain->triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
   if (modify->n_pre_neighbor) modify->pre_neighbor();
+  
   neighbor->build(1);
 
-  // energy_stored = energy of current state
-  // will be updated after accepted swaps
-
   energy_stored = energy_full();
+
+  if (use_local_energy) {
+    if (local_energy_cache == nullptr || atom->nmax > max_affected) {
+      memory->destroy(local_energy_cache);
+      memory->destroy(local_energy_new);
+      memory->destroy(is_affected);
+      memory->destroy(affected_list);
+      max_affected = atom->nmax;
+      memory->create(local_energy_cache, max_affected, "atom/swap:local_energy_cache");
+      memory->create(local_energy_new, max_affected, "atom/swap:local_energy_new");
+      memory->create(is_affected, max_affected, "atom/swap:is_affected");
+      memory->create(affected_list, max_affected, "atom/swap:affected_list");
+      for (int i = 0; i < max_affected; i++) is_affected[i] = 0;
+    }
+    
+    int nlocal = atom->nlocal;
+    if (list != nullptr && force->pair != nullptr) {
+      for (int i = 0; i < nlocal; i++) {
+        local_energy_cache[i] = force->pair->compute_atomic_energy(i, list);
+      }
+    }
+  }
 
   // attempt Ncycle atom swaps
 
@@ -707,6 +727,12 @@ int FixAtomSwap::attempt_swap()
       // accepted: apply swap permanently on all procs (local + ghosts)
       // we reuse the same logic as energy_local_delta but make it stick
       
+      // Update local energy cache with new values since swap is accepted
+      for (int i = 0; i < n_affected_count; i++) {
+        int idx = affected_list[i];
+        local_energy_cache[idx] = local_energy_new[idx];
+      }
+
       int total_to_sync = 2 * group_size;
       std::vector<tagint> swapped_tags(total_to_sync, 0);
       std::vector<tagint> local_tags(total_to_sync, 0);
@@ -857,21 +883,22 @@ int FixAtomSwap::attempt_swap()
 double FixAtomSwap::energy_local_delta()
 {
   int nlocal = atom->nlocal;
-  int nghost = atom->nghost;
-
-  if (nlocal + nghost > max_affected) {
+  
+  if (nlocal + atom->nghost > max_affected) {
     memory->destroy(is_affected);
     memory->destroy(affected_list);
+    memory->destroy(local_energy_new);
     max_affected = atom->nmax;
     memory->create(is_affected, max_affected, "atom/swap:is_affected");
     memory->create(affected_list, max_affected, "atom/swap:affected_list");
+    memory->create(local_energy_new, max_affected, "atom/swap:local_energy_new");
     for (int i = 0; i < max_affected; i++) is_affected[i] = 0;
   }
 
   int total_to_sync = (semi_grand_flag) ? 1 : 2 * group_size;
   std::vector<tagint> swapped_tags(total_to_sync, 0);
-
   std::vector<tagint> local_tags(total_to_sync, 0);
+  
   if (!semi_grand_flag) {
     for (int n = 0; n < group_size; n++) {
       if (local_swap_igroup[n] >= 0) local_tags[n] = atom->tag[local_swap_igroup[n]];
@@ -882,18 +909,26 @@ double FixAtomSwap::energy_local_delta()
   MPI_Allreduce(local_tags.data(), swapped_tags.data(), total_to_sync, MPI_LMP_TAGINT, MPI_MAX, world);
 
   std::vector<int> local_indices(total_to_sync);
-  for (int n = 0; n < total_to_sync; n++) local_indices[n] = atom->map(swapped_tags[n]);
+  for (int n = 0; n < total_to_sync; n++) {
+     local_indices[n] = atom->map(swapped_tags[n]);
+  }
 
   int naffected = 0;
   for (int n = 0; n < total_to_sync; n++) {
     int idx = local_indices[n];
-    if (idx < 0) continue;
-    if (idx < nlocal && !is_affected[idx]) {
+    if (idx < 0 || idx >= nlocal) continue;
+
+    if (!is_affected[idx]) {
       is_affected[idx] = 1;
       affected_list[naffected++] = idx;
     }
+    
+    if (list == nullptr) continue;
+    if (list->firstneigh == nullptr) continue;
+
     int *jlist = list->firstneigh[idx];
     int jnum = list->numneigh[idx];
+    
     for (int jj = 0; jj < jnum; jj++) {
       int nbr = jlist[jj] & NEIGHMASK;
       if (nbr < nlocal && !is_affected[nbr]) {
@@ -903,32 +938,31 @@ double FixAtomSwap::energy_local_delta()
     }
   }
 
+  n_affected_count = naffected;
   double e_before = 0.0;
-  for (int i = 0; i < naffected; i++)
-    e_before += force->pair->compute_atomic_energy(affected_list[i], list);
+  for (int i = 0; i < naffected; i++) e_before += local_energy_cache[affected_list[i]];
 
   int itype = type_list[0];
   int jtype = type_list[1];
   for (int n = 0; n < total_to_sync; n++) {
     int idx = local_indices[n];
-    if (idx >= 0) atom->type[idx] = (n < group_size) ? jtype : itype;
+    if (idx >= 0 && idx < nlocal) atom->type[idx] = (n < group_size) ? jtype : itype;
   }
 
   double e_after = 0.0;
-  for (int i = 0; i < naffected; i++)
-    e_after += force->pair->compute_atomic_energy(affected_list[i], list);
+  for (int i = 0; i < naffected; i++) {
+    int atom_idx = affected_list[i];
+    local_energy_new[atom_idx] = force->pair->compute_atomic_energy(atom_idx, list);
+    e_after += local_energy_new[atom_idx];
+  }
 
   for (int n = 0; n < total_to_sync; n++) {
     int idx = local_indices[n];
-    if (idx >= 0) atom->type[idx] = (n < group_size) ? itype : jtype;
+    if (idx >= 0 && idx < nlocal) atom->type[idx] = (n < group_size) ? itype : jtype;
   }
-
+  
   for (int i = 0; i < naffected; i++) is_affected[affected_list[i]] = 0;
-
-  double delta_local = e_after - e_before;
-  double delta_total;
-  MPI_Allreduce(&delta_local, &delta_total, 1, MPI_DOUBLE, MPI_SUM, world);
-  return delta_total;
+  return e_after - e_before;
 }
 
 /* ----------------------------------------------------------------------
@@ -937,6 +971,8 @@ double FixAtomSwap::energy_local_delta()
 
 double FixAtomSwap::energy_full()
 {
+  if (!c_pe) return 0.0;
+  
   int eflag = 1;
   int vflag = 0;
 
@@ -1012,11 +1048,8 @@ int FixAtomSwap::pick_j_swap_atom()
 
 void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
 {
-  // initialize all to -1 (no atom on this proc)
   for (int n = 0; n < nselect; n++) selected[n] = -1;
 
-  // generate N unique random global indices using rejection sampling
-  // use random_equal so all procs generate same sequence
   std::vector<int> global_indices;
   global_indices.reserve(nselect);
   
@@ -1051,7 +1084,6 @@ void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
 
 void FixAtomSwap::pick_jswap_group(int *selected, int nselect)
 {
-  // initialize all to -1 (no atom on this proc)
   for (int n = 0; n < nselect; n++) selected[n] = -1;
 
   // generate N unique random global indices using rejection sampling

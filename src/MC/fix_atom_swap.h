@@ -80,7 +80,10 @@ class FixAtomSwap : public Fix {
   int *local_swap_atom_list;
   int *is_affected;            // mark array for CollectAffectedAtoms
   int *affected_list;          // list of local atoms to sum energy over
+  double *local_energy_cache;  // cache of per-atom energies for strong scaling
+  double *local_energy_new;    // temporary storage for new energies
   int max_affected;
+  int n_affected_count;        // number of affected atoms in current step
 
   int group_size;              // number of atoms to swap simultaneously (N)
   int *local_swap_igroup;      // indices of N type-1 atoms selected for swap
