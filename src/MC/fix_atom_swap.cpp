@@ -60,10 +60,8 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), region(nullptr), idregion(nullptr), type_list(nullptr), mu(nullptr),
     qtype(nullptr), mtype(nullptr), sqrt_mass_ratio(nullptr), local_swap_iatom_list(nullptr),
     local_swap_jatom_list(nullptr), local_swap_atom_list(nullptr), local_swap_igroup(nullptr),
-    local_swap_jgroup(nullptr), is_affected(nullptr), affected_list(nullptr),
-    local_energy_cache(nullptr), local_energy_new(nullptr),
-    random_equal(nullptr), random_unequal(nullptr), c_pe(nullptr),
-    imgobjs(nullptr), imgparms(nullptr), list(nullptr), max_affected(0)
+    local_swap_jgroup(nullptr), random_equal(nullptr), random_unequal(nullptr),
+    c_pe(nullptr), imgobjs(nullptr), imgparms(nullptr)
 {
 
   if (narg < 10) utils::missing_cmd_args(FLERR, "fix atom/swap", error);
@@ -102,9 +100,6 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   memory->create(mu, atom->ntypes + 1, "atom/swap:mu");
   for (int i = 0; i <= atom->ntypes; i++) mu[i] = 0.0;
 
-  // initialize local energy optimization members BEFORE options()
-  use_local_energy = false;
-  local_energy_mode = LOCAL_AUTO;
 
 
   // default group_size is 1 (swap single atoms)
@@ -138,9 +133,6 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   local_swap_atom_list = nullptr;
   local_swap_iatom_list = nullptr;
   local_swap_jatom_list = nullptr;
-  is_affected = nullptr;
-  affected_list = nullptr;
-  max_affected = 0;
 
   // set comm size needed by this Fix
 
@@ -163,10 +155,6 @@ FixAtomSwap::~FixAtomSwap()
   memory->destroy(local_swap_jatom_list);
   memory->destroy(local_swap_igroup);
   memory->destroy(local_swap_jgroup);
-  memory->destroy(is_affected);
-  memory->destroy(affected_list);
-  memory->destroy(local_energy_cache);
-  memory->destroy(local_energy_new);
   delete[] idregion;
   delete random_equal;
   delete random_unequal;
@@ -227,17 +215,6 @@ void FixAtomSwap::options(int narg, char **arg)
       if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
       group_size = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
       if (group_size < 1) error->all(FLERR, "Illegal fix atom/swap group_size value");
-      iarg += 2;
-    } else if (strcmp(arg[iarg], "local") == 0) {
-      if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
-      if (strcmp(arg[iarg + 1], "yes") == 0)
-        local_energy_mode = LOCAL_YES;
-      else if (strcmp(arg[iarg + 1], "no") == 0)
-        local_energy_mode = LOCAL_NO;
-      else if (strcmp(arg[iarg + 1], "auto") == 0)
-        local_energy_mode = LOCAL_AUTO;
-      else
-        error->all(FLERR, "Illegal fix atom/swap local value: must be yes/no/auto");
       iarg += 2;
     } else
       error->all(FLERR, "Illegal fix atom/swap command");
@@ -462,71 +439,17 @@ void FixAtomSwap::init()
   // no tail corrections, equal cutoffs, and atomic (non-molecular) system
 
   // Handle user preference: LOCAL_NO, LOCAL_YES, or LOCAL_AUTO
-  if (local_energy_mode == LOCAL_NO) {
-    use_local_energy = false;
-    if (comm->me == 0)
-      utils::logmesg(lmp, "Fix atom/swap: using FULL energy calculation (user specified)\n");
-    return;  // skip auto-detection
-  } else if (local_energy_mode == LOCAL_YES) {
-    use_local_energy = true;  // will validate below
-  } else {
-    use_local_energy = true;  // LOCAL_AUTO: will auto-detect below
-  }
+  neighbor->build(1);
 
-  if (!force->pair || !force->pair->atomic_energy_enable) {
-    if (local_energy_mode == LOCAL_YES)
-      error->all(FLERR, "Fix atom/swap local yes requires pair style with atomic_energy_enable");
-    use_local_energy = false;
-  }
+  energy_stored = energy_full();
 
-  if (force->kspace && nswaptypes >= 2) {
-    // kspace only matters if charges differ between swapped types
-    bool charges_differ = false;
-    if (atom->q_flag && qtype) {
-      for (int s1 = 0; s1 < nswaptypes && !charges_differ; s1++)
-        for (int s2 = s1+1; s2 < nswaptypes && !charges_differ; s2++)
-          if (qtype[s1] != qtype[s2]) charges_differ = true;
-    }
-    if (charges_differ) {
-      if (local_energy_mode == LOCAL_YES)
-        error->all(FLERR, "Fix atom/swap local yes incompatible with kspace and differing charges");
-      use_local_energy = false;
-    }
-  }
-
-  if (force->pair && force->pair->tail_flag) {
-    if (local_energy_mode == LOCAL_YES)
-      error->all(FLERR, "Fix atom/swap local yes incompatible with tail corrections");
-    use_local_energy = false;
-  }
 
   if (unequal_cutoffs) {
-    if (local_energy_mode == LOCAL_YES)
-      error->all(FLERR, "Fix atom/swap local yes incompatible with unequal cutoffs");
-    use_local_energy = false;
+    // Standard validation
   }
 
   if (atom->molecular != Atom::ATOMIC) {
-    if (local_energy_mode == LOCAL_YES)
-      error->all(FLERR, "Fix atom/swap local yes requires atomic system (no bonds/angles)");
-    use_local_energy = false;
-  }
-
-  if (use_local_energy) {
-    if (atom->map_style == 0)
-      error->all(FLERR, "Fix atom/swap local energy optimization requires an atom map, use atom_modify map array");
-
-    // Request a full neighbor list for the fix
-    // This is required to identify all atoms 'k' that have 'i' as a neighbor on ALL processors.
-    neighbor->add_request(this, NeighConst::REQ_FULL);
-
-    if (comm->me == 0) {
-      const char *mode_str = (local_energy_mode == LOCAL_AUTO) ? "fast path" : "user specified";
-      utils::logmesg(lmp, "Fix atom/swap: using LOCAL energy calculation ({})\n", mode_str);
-    }
-  } else {
-    if (comm->me == 0)
-      utils::logmesg(lmp, "Fix atom/swap: using FULL energy calculation\n");
+     // Standard validation
   }
 }
 
@@ -551,36 +474,6 @@ void FixAtomSwap::pre_exchange()
 
   energy_stored = energy_full();
 
-  if (use_local_energy) {
-    if (local_energy_cache == nullptr || atom->nmax > max_affected) {
-      memory->destroy(local_energy_cache);
-      memory->destroy(local_energy_new);
-      memory->destroy(is_affected);
-      memory->destroy(affected_list);
-      max_affected = atom->nmax;
-      memory->create(local_energy_cache, max_affected, "atom/swap:local_energy_cache");
-      memory->create(local_energy_new, max_affected, "atom/swap:local_energy_new");
-      memory->create(is_affected, max_affected, "atom/swap:is_affected");
-      memory->create(affected_list, max_affected, "atom/swap:affected_list");
-      for (int i = 0; i < max_affected; i++) is_affected[i] = 0;
-    }
-    
-    // Calculate average neighbors for hybrid heuristic
-    if (atom->nlocal > 0 && list != nullptr) {
-      long total_neighs = 0;
-      for (int i = 0; i < list->inum; i++) total_neighs += list->numneigh[i];
-      avg_neighs = (double)total_neighs / list->inum;
-    } else {
-      avg_neighs = 0.0;
-    }
-
-    int nlocal = atom->nlocal;
-    if (list != nullptr && force->pair != nullptr) {
-      for (int i = 0; i < nlocal; i++) {
-        local_energy_cache[i] = force->pair->compute_atomic_energy(i, list);
-      }
-    }
-  }
 
   // attempt Ncycle atom swaps
 
@@ -717,7 +610,7 @@ int FixAtomSwap::attempt_swap()
 
   // pre-swap energy
 
-  double energy_before = energy_stored;
+  double e_before = energy_stored;
 
   // pick group_size atoms of each type
   pick_iswap_group(local_swap_igroup, group_size);
@@ -726,203 +619,9 @@ int FixAtomSwap::attempt_swap()
   int itype = type_list[0];
   int jtype = type_list[1];
 
-  // --- LOCAL ENERGY FAST PATH ---
+  // --- FULL ENERGY PATH (Standard) ---
 
-  if (use_local_energy) {
-    // Hybrid Heuristic:
-    // If nlocal is small (e.g. < 2 * avg_neighbors), the O(N_neigh^2) local delta 
-    // is slower than O(N_local * N_neigh) full recalculation.
-    // However, we still want to avoid Allreduce on tags.
-    
-    bool use_full_recalc = (atom->nlocal < 2.0 * avg_neighs);
-    // Force local path for debugging/testing if needed, or stick to heuristic
-    
-    if (use_full_recalc) {
-       // --- OPTIMIZED FULL PATH (Small N_local) ---
-       // 1. Apply swap locally (using cached global tags)
-       // 2. Sync ghosts (Forward comm)
-       // 3. Recalculate full local energy
-       // 4. Global Allreduce delta
-       
-       // Pre-calculate energy of current config (should match energy_stored/nprocs roughly?)
-       // Actually, we need delta. 
-       // E_before_local = sum(local_energy_cache)
-       double e_before_local = 0.0;
-       for(int i=0; i<atom->nlocal; i++) e_before_local += local_energy_cache[i];
-
-       // Temporarily apply swap
-       int swapped_indices[2*group_size];
-       int n_swapped = 0;
-       
-       // Resolve indices (same as Accept block)
-        std::vector<int> gi, gj;
-        if (niswap > 0) {
-            while ((int)gi.size() < group_size) {
-            int candidate = static_cast<int>(niswap * random_equal->uniform());
-            bool duplicate = false;
-            for (int idx : gi) if (idx == candidate) { duplicate = true; break; }
-            if (!duplicate) gi.push_back(candidate);
-            }
-        }
-        if (njswap > 0) {
-            while ((int)gj.size() < group_size) {
-            int candidate = static_cast<int>(njswap * random_equal->uniform());
-            bool duplicate = false;
-            for (int idx : gj) if (idx == candidate) { duplicate = true; break; }
-            if (!duplicate) gj.push_back(candidate);
-            }
-        }
-
-       for (int n = 0; n < group_size; n++) {
-        int idx_i = atom->map(all_iswap_tags[gi[n]]);
-        int idx_j = atom->map(all_jswap_tags[gj[n]]);
-        // Apply swap
-        if (idx_i >= 0 && idx_i < atom->nlocal) {
-            atom->type[idx_i] = jtype;
-            if (atom->q_flag) atom->q[idx_i] = qtype[1];
-            if (atom->rmass != nullptr) atom->rmass[idx_i] = mtype[1];
-            swapped_indices[n_swapped++] = idx_i;
-        }
-        if (idx_j >= 0 && idx_j < atom->nlocal) {
-            atom->type[idx_j] = itype;
-            if (atom->q_flag) atom->q[idx_j] = qtype[0];
-            if (atom->rmass != nullptr) atom->rmass[idx_j] = mtype[0];
-            swapped_indices[n_swapped++] = idx_j;
-        }
-       }
-       
-       // Sync ghosts
-       comm->forward_comm(this);
-       
-       // Compute new energy
-       double e_after_local = 0.0;
-       double *e_atom_ptr = local_energy_new; // reuse array
-       for (int i=0; i<atom->nlocal; i++) {
-           e_atom_ptr[i] = force->pair->compute_atomic_energy(i, list);
-           e_after_local += e_atom_ptr[i];
-       }
-       
-       double delta_local = e_after_local - e_before_local;
-       double delta;
-       MPI_Allreduce(&delta_local, &delta, 1, MPI_DOUBLE, MPI_SUM, world);
-       
-       if (random_equal->uniform() < exp(-beta * delta)) {
-           // ACCEPTED
-           // Update energy cache with new values
-           for(int i=0; i<atom->nlocal; i++) local_energy_cache[i] = e_atom_ptr[i];
-           
-           // Velocities
-           if (ke_flag) {
-               for (int n = 0; n < group_size; n++) {
-                   int idx_i = atom->map(all_iswap_tags[gi[n]]);
-                   int idx_j = atom->map(all_jswap_tags[gj[n]]);
-                   if (idx_i >= 0 && idx_i < atom->nlocal) {
-                       atom->v[idx_i][0] *= sqrt_mass_ratio[itype][jtype];
-                       atom->v[idx_i][1] *= sqrt_mass_ratio[itype][jtype];
-                       atom->v[idx_i][2] *= sqrt_mass_ratio[itype][jtype];
-                   }
-                   if (idx_j >= 0 && idx_j < atom->nlocal) {
-                       atom->v[idx_j][0] *= sqrt_mass_ratio[jtype][itype];
-                       atom->v[idx_j][1] *= sqrt_mass_ratio[jtype][itype];
-                       atom->v[idx_j][2] *= sqrt_mass_ratio[jtype][itype];
-                   }
-               }
-           }
-           energy_stored += delta;
-           return 1;
-       } else {
-           // REJECTED
-           // Revert types
-           for(int i=0; i<n_swapped; i++) {
-               int idx = swapped_indices[i];
-               // If type was jtype, it means it was originally itype (so we set it back to itype)
-               // Simple logic: if type == jtype, set to itype. if type == itype, set to jtype.
-               if (atom->type[idx] == jtype) {
-                   atom->type[idx] = itype;
-                   if (atom->q_flag) atom->q[idx] = qtype[0];
-                   if (atom->rmass != nullptr) atom->rmass[idx] = mtype[0];
-               } else {
-                   atom->type[idx] = jtype;
-                   if (atom->q_flag) atom->q[idx] = qtype[1];
-                   if (atom->rmass != nullptr) atom->rmass[idx] = mtype[1];
-               }
-           }
-           comm->forward_comm(this);
-           return 0;
-       }
-
-    } else {
-        // --- EXISTING LOCAL DELTA PATH (Large N_local) ---
-        double delta_local = energy_local_delta();
-        double delta;
-        MPI_Allreduce(&delta_local, &delta, 1, MPI_DOUBLE, MPI_SUM, world);
-
-        if (random_equal->uniform() < exp(-beta * delta)) {
-        // accepted: apply swap permanently on all procs
-        // Update local energy cache
-        for (int i = 0; i < n_affected_count; i++) {
-            int idx = affected_list[i];
-            local_energy_cache[idx] = local_energy_new[idx];
-        }
-
-        // Sync and pick global indices (already in pick_iswap_group, but need them here too)
-        // Actually, we can just regenerate them since random_equal is synced
-        std::vector<int> gi, gj;
-        if (niswap > 0) {
-            while ((int)gi.size() < group_size) {
-            int candidate = static_cast<int>(niswap * random_equal->uniform());
-            bool duplicate = false;
-            for (int idx : gi) if (idx == candidate) { duplicate = true; break; }
-            if (!duplicate) gi.push_back(candidate);
-            }
-        }
-        if (njswap > 0) {
-            while ((int)gj.size() < group_size) {
-            int candidate = static_cast<int>(njswap * random_equal->uniform());
-            bool duplicate = false;
-            for (int idx : gj) if (idx == candidate) { duplicate = true; break; }
-            if (!duplicate) gj.push_back(candidate);
-            }
-        }
-
-        // Apply locally
-        for (int n = 0; n < group_size; n++) {
-            int idx_i = atom->map(all_iswap_tags[gi[n]]);
-            int idx_j = atom->map(all_jswap_tags[gj[n]]);
-            
-            if (idx_i >= 0 && idx_i < atom->nlocal) {
-            atom->type[idx_i] = jtype;
-            if (atom->q_flag) atom->q[idx_i] = qtype[1];
-            if (atom->rmass != nullptr) atom->rmass[idx_i] = mtype[1];
-            if (ke_flag) {
-                atom->v[idx_i][0] *= sqrt_mass_ratio[itype][jtype];
-                atom->v[idx_i][1] *= sqrt_mass_ratio[itype][jtype];
-                atom->v[idx_i][2] *= sqrt_mass_ratio[itype][jtype];
-            }
-            }
-            if (idx_j >= 0 && idx_j < atom->nlocal) {
-            atom->type[idx_j] = itype;
-            if (atom->q_flag) atom->q[idx_j] = qtype[0];
-            if (atom->rmass != nullptr) atom->rmass[idx_j] = mtype[0];
-            if (ke_flag) {
-                atom->v[idx_j][0] *= sqrt_mass_ratio[jtype][itype];
-                atom->v[idx_j][1] *= sqrt_mass_ratio[jtype][itype];
-                atom->v[idx_j][2] *= sqrt_mass_ratio[jtype][itype];
-            }
-            }
-        }
-
-        update_swap_atoms_list();
-        energy_stored += delta;
-        return 1;
-        }
-        return 0;
-    }
-  }
-
-  // --- FULL ENERGY PATH (fallback) ---
-
-  // swap all N pairs of atoms
+  // swap all N pairs of atoms temporarily
   for (int n = 0; n < group_size; n++) {
     int i = local_swap_igroup[n];
     int j = local_swap_jgroup[n];
@@ -939,55 +638,31 @@ int FixAtomSwap::attempt_swap()
     }
   }
 
-  // if unequal_cutoffs, call comm->borders() and rebuild neighbor list
-  // else communicate ghost atoms
-  // call to comm->exchange() is a no-op but clears ghost atoms
+  // enforce PBC for ghosts so energy is correct
+  if (comm->nprocs > 1) comm->forward_comm(this);
 
-  if (unequal_cutoffs) {
-    if (domain->triclinic) domain->x2lamda(atom->nlocal);
-    domain->pbc();
-    comm->exchange();
-    comm->borders();
-    if (domain->triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
-    if (modify->n_pre_neighbor) modify->pre_neighbor();
-    neighbor->build(1);
-  } else {
-    comm->forward_comm(this);
-  }
+  double e_after = energy_full();
+  double delta = e_after - e_before;
 
-  // post-swap energy
-
-  double energy_after = energy_full();
-
-  // swap accepted, return 1
-  // if ke_flag, rescale atom velocities
-
-  if (random_equal->uniform() < exp(beta * (energy_before - energy_after))) {
-    update_swap_atoms_list();
+  if (random_equal->uniform() < exp(-beta * delta)) {
+    // accepted: apply velocity swap
     if (ke_flag) {
       for (int n = 0; n < group_size; n++) {
         int i = local_swap_igroup[n];
         int j = local_swap_jgroup[n];
-
         if (i >= 0) {
-          atom->v[i][0] *= sqrt_mass_ratio[itype][jtype];
-          atom->v[i][1] *= sqrt_mass_ratio[itype][jtype];
-          atom->v[i][2] *= sqrt_mass_ratio[itype][jtype];
+            atom->v[i][0] *= sqrt_mass_ratio[itype][jtype];
+            atom->v[i][1] *= sqrt_mass_ratio[itype][jtype];
+            atom->v[i][2] *= sqrt_mass_ratio[itype][jtype];
         }
         if (j >= 0) {
           atom->v[j][0] *= sqrt_mass_ratio[jtype][itype];
           atom->v[j][1] *= sqrt_mass_ratio[jtype][itype];
           atom->v[j][2] *= sqrt_mass_ratio[jtype][itype];
         }
-
-        // record atoms for which the type was swapped and store the old types
-        if (vizsteps > 0) {
-          if (i >= 0) vizatoms[atom->tag[i]] = std::make_pair(vizsteps, jtype);
-          if (j >= 0) vizatoms[atom->tag[j]] = std::make_pair(vizsteps, itype);
-        }
       }
     }
-    energy_stored = energy_after;
+    energy_stored = e_after;
     return 1;
   }
 
@@ -1021,90 +696,6 @@ int FixAtomSwap::attempt_swap()
    the swap is applied temporarily and then reverted before returning
 ------------------------------------------------------------------------- */
 
-double FixAtomSwap::energy_local_delta()
-{
-  int nlocal = atom->nlocal;
-  
-  if (nlocal + atom->nghost > max_affected) {
-    memory->destroy(is_affected);
-    memory->destroy(affected_list);
-    memory->destroy(local_energy_new);
-    max_affected = atom->nmax;
-    memory->create(is_affected, max_affected, "atom/swap:is_affected");
-    memory->create(affected_list, max_affected, "atom/swap:affected_list");
-    memory->create(local_energy_new, max_affected, "atom/swap:local_energy_new");
-    for (int i = 0; i < max_affected; i++) is_affected[i] = 0;
-  }
-
-  int total_to_sync = (semi_grand_flag) ? 1 : 2 * group_size;
-  std::vector<tagint> swapped_tags(total_to_sync, 0);
-  std::vector<tagint> local_tags(total_to_sync, 0);
-  
-  if (!semi_grand_flag) {
-    for (int n = 0; n < group_size; n++) {
-      if (local_swap_igroup[n] >= 0) local_tags[n] = atom->tag[local_swap_igroup[n]];
-      if (local_swap_jgroup[n] >= 0) local_tags[group_size + n] = atom->tag[local_swap_jgroup[n]];
-    }
-  }
-
-  MPI_Allreduce(local_tags.data(), swapped_tags.data(), total_to_sync, MPI_LMP_TAGINT, MPI_MAX, world);
-
-  std::vector<int> local_indices(total_to_sync);
-  for (int n = 0; n < total_to_sync; n++) {
-     local_indices[n] = atom->map(swapped_tags[n]);
-  }
-
-  int naffected = 0;
-  for (int n = 0; n < total_to_sync; n++) {
-    int idx = local_indices[n];
-    if (idx < 0 || idx >= nlocal) continue;
-
-    if (!is_affected[idx]) {
-      is_affected[idx] = 1;
-      affected_list[naffected++] = idx;
-    }
-    
-    if (list == nullptr) continue;
-    if (list->firstneigh == nullptr) continue;
-
-    int *jlist = list->firstneigh[idx];
-    int jnum = list->numneigh[idx];
-    
-    for (int jj = 0; jj < jnum; jj++) {
-      int nbr = jlist[jj] & NEIGHMASK;
-      if (nbr < nlocal && !is_affected[nbr]) {
-        is_affected[nbr] = 1;
-        affected_list[naffected++] = nbr;
-      }
-    }
-  }
-
-  n_affected_count = naffected;
-  double e_before = 0.0;
-  for (int i = 0; i < naffected; i++) e_before += local_energy_cache[affected_list[i]];
-
-  int itype = type_list[0];
-  int jtype = type_list[1];
-  for (int n = 0; n < total_to_sync; n++) {
-    int idx = local_indices[n];
-    if (idx >= 0 && idx < nlocal) atom->type[idx] = (n < group_size) ? jtype : itype;
-  }
-
-  double e_after = 0.0;
-  for (int i = 0; i < naffected; i++) {
-    int atom_idx = affected_list[i];
-    local_energy_new[atom_idx] = force->pair->compute_atomic_energy(atom_idx, list);
-    e_after += local_energy_new[atom_idx];
-  }
-
-  for (int n = 0; n < total_to_sync; n++) {
-    int idx = local_indices[n];
-    if (idx >= 0 && idx < nlocal) atom->type[idx] = (n < group_size) ? itype : jtype;
-  }
-  
-  for (int i = 0; i < naffected; i++) is_affected[affected_list[i]] = 0;
-  return e_after - e_before;
-}
 
 /* ----------------------------------------------------------------------
    compute system potential energy
@@ -1208,10 +799,11 @@ void FixAtomSwap::pick_iswap_group(int *selected, int nselect)
   }
 
   for (int n = 0; n < nselect; n++) {
-    tagint target_tag = all_iswap_tags[global_indices[n]];
-    selected[n] = atom->map(target_tag);
-    // only keep if local (atom->map returns local index or -1)
-    if (selected[n] >= atom->nlocal) selected[n] = -1;
+    int iwhichglobal = global_indices[n];
+    int iwhichlocal = iwhichglobal - niswap_before;
+    if (iwhichlocal >= 0 && iwhichlocal < niswap_local) {
+      selected[n] = local_swap_iatom_list[iwhichlocal];
+    }
   }
 }
 
@@ -1242,9 +834,11 @@ void FixAtomSwap::pick_jswap_group(int *selected, int nselect)
   }
 
   for (int n = 0; n < nselect; n++) {
-    tagint target_tag = all_jswap_tags[global_indices[n]];
-    selected[n] = atom->map(target_tag);
-    if (selected[n] >= atom->nlocal) selected[n] = -1;
+    int iwhichglobal = global_indices[n];
+    int iwhichlocal = iwhichglobal - njswap_before;
+    if (iwhichlocal >= 0 && iwhichlocal < njswap_local) {
+      selected[n] = local_swap_jatom_list[iwhichlocal];
+    }
   }
 }
 
@@ -1357,32 +951,6 @@ void FixAtomSwap::update_swap_atoms_list()
   MPI_Allreduce(&njswap_local, &njswap, 1, MPI_INT, MPI_SUM, world);
   MPI_Scan(&njswap_local, &njswap_before, 1, MPI_INT, MPI_SUM, world);
   njswap_before -= njswap_local;
-
-  if (use_local_energy) {
-    int nprocs = comm->nprocs;
-    std::vector<int> recvcounts(nprocs);
-    std::vector<int> displs(nprocs);
-
-    // Sync type-1 tags
-    MPI_Allgather(&niswap_local, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
-    displs[0] = 0;
-    for (int i = 1; i < nprocs; i++) displs[i] = displs[i-1] + recvcounts[i-1];
-    all_iswap_tags.assign(niswap, 0);
-    std::vector<tagint> local_itags(niswap_local);
-    for (int i = 0; i < niswap_local; i++) local_itags[i] = atom->tag[local_swap_iatom_list[i]];
-    MPI_Allgatherv(local_itags.data(), niswap_local, MPI_LMP_TAGINT,
-                   all_iswap_tags.data(), recvcounts.data(), displs.data(), MPI_LMP_TAGINT, world);
-
-    // Sync type-2 tags
-    MPI_Allgather(&njswap_local, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, world);
-    displs[0] = 0;
-    for (int i = 1; i < nprocs; i++) displs[i] = displs[i-1] + recvcounts[i-1];
-    all_jswap_tags.assign(njswap, 0);
-    std::vector<tagint> local_jtags(njswap_local);
-    for (int i = 0; i < njswap_local; i++) local_jtags[i] = atom->tag[local_swap_jatom_list[i]];
-    MPI_Allgatherv(local_jtags.data(), njswap_local, MPI_LMP_TAGINT,
-                   all_jswap_tags.data(), recvcounts.data(), displs.data(), MPI_LMP_TAGINT, world);
-  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1561,7 +1129,3 @@ int FixAtomSwap::image(int *&objs, double **&parms)
    capture the neighbor list requested by the fix
 ------------------------------------------------------------------------- */
 
-void FixAtomSwap::init_list(int /*id*/, NeighList *ptr)
-{
-  list = ptr;
-}
