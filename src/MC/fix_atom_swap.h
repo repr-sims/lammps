@@ -85,6 +85,7 @@ class FixAtomSwap : public Fix {
   double *local_energy_new;    // temporary storage for new energies
   int max_affected;
   int n_affected_count;        // number of affected atoms in current step
+  double avg_neighs;           // average number of neighbors per atom
 
   int group_size;              // number of atoms to swap simultaneously (N)
   int *local_swap_igroup;      // indices of N type-1 atoms selected for swap
